@@ -5,7 +5,7 @@ import (
 	"sync"
 )
 
-// Node representa um participante na simulação. (struct sem alterações)
+// Node representa um participante na simulação.
 type Node struct {
 	ID             int
 	Network        Network
@@ -13,40 +13,40 @@ type Node struct {
 	messageChannel chan Message
 }
 
-// ProtocolFactory continua o mesmo
-type ProtocolFactory func(node *Node, sim *Simulation) ConsensusProtocol
+// ProtocolFactory foi atualizada para que o protocolo conheça o tamanho da rede.
+type ProtocolFactory func(node *Node, sim *Simulation, mc *MetricsCollector) ConsensusProtocol
 
-// NewNode continua o mesmo
-func NewNode(id int, network Network, sim *Simulation, factory ProtocolFactory) *Node {
+// NewNode foi atualizado para passar os novos argumentos para a fábrica.
+func NewNode(id int, network Network, sim *Simulation, mc *MetricsCollector, factory ProtocolFactory) *Node {
 	node := &Node{
 		ID:             id,
 		Network:        network,
 		messageChannel: make(chan Message, 4096),
 	}
-	node.Protocol = factory(node, sim)
+
+	// O número de nós e outras dependências agora são passados para a fábrica.
+	node.Protocol = factory(node, sim, mc)
+
 	network.Register(id, node.messageChannel)
 	return node
 }
 
 // Run foi atualizado para aceitar o WaitGroup
 func (n *Node) Run(wg *sync.WaitGroup) {
-	// Inicia a máquina de estados do protocolo.
-	// O método Start() agora é responsável por agendar o primeiro evento.
+	// Inicia a máquina de estados do protocolo, que agenda o primeiro evento.
 	n.Protocol.Start()
 
-	// *** SINALIZAÇÃO ***
-	// Depois de agendar seu evento inicial, o nó avisa ao WaitGroup que ele "nasceu".
+	// Avisa ao WaitGroup que este nó terminou sua inicialização.
 	wg.Done()
 
-	// Loop para processar mensagens recebidas, como antes.
+	// Loop para processar mensagens recebidas.
 	for msg := range n.messageChannel {
 		n.Protocol.HandleMessage(msg)
 	}
-
 	fmt.Printf("Nó %d encerrando.\n", n.ID)
 }
 
-// CloseChannel continua o mesmo
+// CloseChannel não precisa de alterações
 func (n *Node) CloseChannel() {
 	close(n.messageChannel)
 }

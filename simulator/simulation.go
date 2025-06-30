@@ -3,17 +3,16 @@ package simulator
 import (
 	"container/heap"
 	"runtime"
+	"sync"
 	"time"
 )
 
-// Event define uma ação agendada na simulação. (Sem alterações)
+// Event e EventQueue não mudam
 type Event struct {
 	Timestamp float64
 	Handler   func()
 	index     int
 }
-
-// EventQueue é uma fila de prioridades para eventos. (Sem alterações)
 type EventQueue []*Event
 
 func (eq EventQueue) Len() int           { return len(eq) }
@@ -35,10 +34,11 @@ func (eq *EventQueue) Pop() interface{} {
 	return event
 }
 
-// Simulation gerencia o estado e a execução da simulação.
+// Simulation agora inclui um Mutex para acesso seguro à fila.
 type Simulation struct {
 	CurrentTime float64
 	eventQueue  EventQueue
+	mutex       sync.Mutex // Adicionado Mutex para thread-safety
 }
 
 func NewSimulation() *Simulation {
@@ -48,8 +48,12 @@ func NewSimulation() *Simulation {
 	}
 }
 
-// Schedule adiciona um evento à fila para execução futura.
+// Schedule agora é "thread-safe".
 func (s *Simulation) Schedule(handler func(), delay float64) {
+	// Bloqueia o mutex para garantir acesso exclusivo à fila.
+	s.mutex.Lock()
+	defer s.mutex.Unlock() // Garante que o mutex será liberado ao sair da função.
+
 	if delay < 0 {
 		delay = 0
 	}
@@ -60,37 +64,44 @@ func (s *Simulation) Schedule(handler func(), delay float64) {
 	heap.Push(&s.eventQueue, event)
 }
 
-// RunUntil executa a simulação até um determinado tempo limite.
-// *** LÓGICA CORRIGIDA ***
+// RunUntil foi refatorado para usar o mutex e evitar condições de corrida.
 func (s *Simulation) RunUntil(limit float64) {
 	for {
-		// Se a fila de eventos está vazia, há duas possibilidades:
-		// 1. A simulação realmente terminou.
-		// 2. As goroutines dos nós estão processando e irão agendar novos eventos.
+		s.mutex.Lock() // Bloqueia o acesso no início de cada iteração.
+
+		// Se a fila estiver vazia, precisamos liberar o lock e esperar.
 		if len(s.eventQueue) == 0 {
-			// Se o tempo já passou do limite, podemos sair com segurança.
+			s.mutex.Unlock() // Libera para que outras goroutines possam agendar eventos.
+
+			// Se já passamos do tempo, podemos sair.
 			if s.CurrentTime >= limit {
 				break
 			}
-			// Damos uma chance para outras goroutines (os nós) rodarem e agendarem eventos.
-			// time.Sleep é uma forma de fazer isso, mas runtime.Gosched() é mais apropriado.
+
+			// Cede o processador para outras goroutines.
 			runtime.Gosched()
-			// Pequeno sleep para evitar busy-waiting agressivo se não houver eventos por um tempo.
+			// Um pequeno sleep evita que este loop consuma 100% da CPU se não houver eventos.
 			time.Sleep(1 * time.Millisecond)
-			continue
+			continue // Volta para o início do loop.
 		}
 
-		// Pega o próximo evento da fila.
-		nextEvent := s.eventQueue[0] // Espia o evento sem removê-lo
+		// Espia o próximo evento (com o lock ainda ativo).
+		nextEvent := s.eventQueue[0]
 
-		// Se o próximo evento está além do nosso limite de tempo, paramos.
+		// Se o próximo evento está além do limite de tempo, liberamos o lock e saímos.
 		if nextEvent.Timestamp > limit {
+			s.mutex.Unlock()
 			break
 		}
 
-		// Remove o evento e o processa.
+		// Remove o evento da fila de forma atômica.
 		event := heap.Pop(&s.eventQueue).(*Event)
 		s.CurrentTime = event.Timestamp
+
+		// Importante: Liberamos o lock ANTES de executar o handler.
+		// Isso evita deadlocks caso o handler tente chamar Schedule() novamente.
+		s.mutex.Unlock()
+
 		event.Handler()
 	}
 }
