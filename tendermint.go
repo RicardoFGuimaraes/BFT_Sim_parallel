@@ -75,8 +75,8 @@ type TendermintProtocol struct {
 // NewTendermintProtocol cria uma nova instância do protocolo.
 func NewTendermintProtocol(node *simulator.Node, sim *simulator.Simulation, mc *simulator.MetricsCollector, numNodes int) simulator.ConsensusProtocol {
 	f := (numNodes - 1) / 3
-	baseTimeout := float64(100 + numNodes*10)
-	delta := float64(50 + numNodes*5)
+	baseTimeout := float64(2000)
+	delta := float64(500)
 
 	return &TendermintProtocol{
 		node:             node,

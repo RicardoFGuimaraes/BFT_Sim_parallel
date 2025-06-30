@@ -18,10 +18,10 @@ const (
 	ProtocolToRun = Tendermint
 	// Altere este valor para ver o impacto no desempenho.
 	// Experimente com 4, 8, 16, 32...
-	NumNodes         = 64
+	NumNodes         = 32
 	NetworkLatencyMs = 100
 	SimulationTimeMs = 1500000 // 15 segundos
-	Debug            = false
+	Debug            = true
 )
 
 // --- Função Principal ---
