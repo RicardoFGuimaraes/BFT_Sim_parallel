@@ -2,48 +2,51 @@ package simulator
 
 import (
 	"fmt"
-	"github.com/fschuetz04/simgo"
+	"sync"
 )
 
-// Node representa um participante genérico na simulação.
-// Ele encapsula o processo simgo e o protocolo de consenso que está executando.
+// Node representa um participante na simulação. (struct sem alterações)
 type Node struct {
-	ID       int
-	Proc     simgo.Process
-	Network  Network
-	Protocol ConsensusProtocol
+	ID             int
+	Network        Network
+	Protocol       ConsensusProtocol
+	messageChannel chan Message
 }
 
-// ProtocolFactory é uma função que cria uma instância de um protocolo de consenso específico.
-type ProtocolFactory func(node *Node) ConsensusProtocol
+// ProtocolFactory continua o mesmo
+type ProtocolFactory func(node *Node, sim *Simulation) ConsensusProtocol
 
-// RunNodeProcess é a função principal que executa a lógica de um nó genérico.
-// Ela escuta por mensagens e as repassa para o protocolo de consenso manipulá-las.
-func RunNodeProcess(proc simgo.Process, id int, network Network, factory ProtocolFactory) {
+// NewNode continua o mesmo
+func NewNode(id int, network Network, sim *Simulation, factory ProtocolFactory) *Node {
 	node := &Node{
-		ID:      id,
-		Proc:    proc,
-		Network: network,
+		ID:             id,
+		Network:        network,
+		messageChannel: make(chan Message, 4096),
 	}
-	// A fábrica cria a implementação específica do protocolo (ex: Tendermint).
-	node.Protocol = factory(node)
+	node.Protocol = factory(node, sim)
+	network.Register(id, node.messageChannel)
+	return node
+}
 
-	messageChannel := make(chan Message, 4096)
-	network.Register(id, messageChannel)
+// Run foi atualizado para aceitar o WaitGroup
+func (n *Node) Run(wg *sync.WaitGroup) {
+	// Inicia a máquina de estados do protocolo.
+	// O método Start() agora é responsável por agendar o primeiro evento.
+	n.Protocol.Start()
 
-	// Inicia a máquina de estados interna do protocolo em uma goroutine separada.
-	go node.Protocol.Start()
+	// *** SINALIZAÇÃO ***
+	// Depois de agendar seu evento inicial, o nó avisa ao WaitGroup que ele "nasceu".
+	wg.Done()
 
-	for {
-		// Aguarda por novas mensagens no canal.
-		select {
-		case msg := <-messageChannel:
-			node.Protocol.HandleMessage(msg)
-		default:
-			if proc.Aborted() {
-				fmt.Printf("Nó %d encerrando.\n", id)
-				return
-			}
-		}
+	// Loop para processar mensagens recebidas, como antes.
+	for msg := range n.messageChannel {
+		n.Protocol.HandleMessage(msg)
 	}
+
+	fmt.Printf("Nó %d encerrando.\n", n.ID)
+}
+
+// CloseChannel continua o mesmo
+func (n *Node) CloseChannel() {
+	close(n.messageChannel)
 }

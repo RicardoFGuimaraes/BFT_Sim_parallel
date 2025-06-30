@@ -1,7 +1,5 @@
 package simulator
 
-import "time"
-
 // Network define a interface para a camada de comunicação.
 // Permite registrar nós e enviar mensagens unicast ou broadcast.
 type Network interface {
@@ -15,8 +13,4 @@ type Network interface {
 type ConsensusProtocol interface {
 	Start()
 	HandleMessage(msg Message)
-}
-type Event interface {
-	Timestamp() time.Time
-	Handle(sim interface{})
 }

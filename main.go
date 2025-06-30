@@ -3,9 +3,7 @@ package main
 import (
 	"BFT-Simulator/simulator"
 	"fmt"
-	_ "time"
-
-	"github.com/fschuetz04/simgo"
+	"sync"
 )
 
 // --- Constantes e Configuração da Simulação ---
@@ -14,53 +12,55 @@ type ProtocolType string
 
 const (
 	Tendermint ProtocolType = "tendermint"
-	HotStuff   ProtocolType = "hotstuff"
 )
 
 const (
-	// Selecione o protocolo para executar aqui
-	ProtocolToRun = Tendermint
-
-	NumNodes         = 16
+	ProtocolToRun    = Tendermint
+	NumNodes         = 32
 	NetworkLatencyMs = 50
-	ViewTimeoutMs    = 4000 // Timeout para uma visão/rodada inteira
-	Debug            = false
+	SimulationTimeMs = 600000 // Aumentado para 5 segundos para ver mais atividade
+	Debug            = true
 )
 
 // --- Função Principal ---
 
 func main() {
-	sim := simgo.NewSimulation()
+	fmt.Println("--- Configurando a Simulação ---")
 
-	// O processo da rede é necessário para que ela possa agendar seus próprios eventos de latência.
-	sim.Process(func(proc simgo.Process) {
-		var network simulator.Network
-		var factory simulator.ProtocolFactory
+	sim := simulator.NewSimulation()
+	network := simulator.NewGossipNetwork(sim, NetworkLatencyMs)
+	factory := func(node *simulator.Node, sim *simulator.Simulation) simulator.ConsensusProtocol {
+		return NewTendermintProtocol(node, sim)
+	}
 
-		switch ProtocolToRun {
-		case Tendermint:
-			fmt.Println("--- Iniciando Simulação com Tendermint ---")
-			network = simulator.NewGossipNetwork(proc, NetworkLatencyMs)
-			factory = func(node *simulator.Node) simulator.ConsensusProtocol {
-				return NewTendermintProtocol(node)
-			}
-		//case HotStuff:
-		//	fmt.Println("--- Iniciando Simulação com HotStuff ---")
-		//	network = simulator.NewStarNetwork(proc, NetworkLatencyMs)
-		//	factory = func(node *simulator.Node) simulator.ConsensusProtocol {
-		//		return NewHotStuffProtocol(node)
-		//	}
-		default:
-			fmt.Println("Protocolo desconhecido.")
-			return
-		}
+	nodes := make([]*simulator.Node, NumNodes)
+	for i := 0; i < NumNodes; i++ {
+		nodes[i] = simulator.NewNode(i, network, sim, factory)
+	}
 
-		// Inicia os processos dos nós genéricos, injetando a fábrica do protocolo selecionado.
-		for i := 0; i < NumNodes; i++ {
-			sim.ProcessReflect(simulator.RunNodeProcess, i, network, factory)
-		}
-	})
+	// *** SOLUÇÃO DE SINCRONIZAÇÃO ***
+	// Usamos um WaitGroup para garantir que todos os nós agendem seu primeiro
+	// evento ANTES que o loop da simulação comece.
+	var wg sync.WaitGroup
+	wg.Add(NumNodes) // Esperaremos por 'NumNodes' sinais de "pronto".
 
-	sim.RunUntil(60000000) // Executa por 20 segundos de tempo simulado.
+	// Inicia a goroutine de cada nó. Elas ficarão esperando por mensagens.
+	for _, node := range nodes {
+		// Passamos a responsabilidade de iniciar o protocolo para a goroutine do nó,
+		// que então sinalizará quando estiver pronta.
+		go node.Run(&wg)
+	}
+
+	// A goroutine 'main' irá pausar aqui e esperar até que todas as outras
+	// goroutines tenham chamado 'wg.Done()'.
+	fmt.Println("Aguardando todos os nós iniciarem...")
+	wg.Wait()
+	fmt.Println("Todos os nós estão prontos. Iniciando a simulação.")
+
+	// 5. Inicia a simulação.
+	// Agora temos 100% de certeza de que a fila de eventos não está vazia.
+	fmt.Printf("\n--- Rodando Simulação por %.1fms ---\n", float64(SimulationTimeMs))
+	sim.RunUntil(float64(SimulationTimeMs))
+
 	fmt.Println("\n--- Simulação Finalizada ---")
 }
