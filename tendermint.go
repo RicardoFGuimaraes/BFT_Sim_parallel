@@ -45,18 +45,16 @@ type DecisionPayload struct {
 
 // --- Constantes Dinâmicas e de Simulação ---
 const (
-	// Atraso para simular o tempo de processamento de uma mensagem pela CPU.
 	NodeProcessingDelayMs = 2.0
 )
 
-// --- Implementação do Protocolo Tendermint (Realista) ---
+// --- Implementação do Protocolo Tendermint ---
 type TendermintProtocol struct {
 	node       *simulator.Node
 	sim        *simulator.Simulation
 	mc         *simulator.MetricsCollector
 	quorumSize int
 
-	// Timeouts agora são variáveis e dependem do tamanho da rede.
 	timeoutPropose   float64
 	timeoutPrevote   float64
 	timeoutPrecommit float64
@@ -74,11 +72,9 @@ type TendermintProtocol struct {
 	precommits map[int]*Vote
 }
 
-// NewTendermintProtocol agora calcula timeouts com base no número de nós.
+// NewTendermintProtocol cria uma nova instância do protocolo.
 func NewTendermintProtocol(node *simulator.Node, sim *simulator.Simulation, mc *simulator.MetricsCollector, numNodes int) simulator.ConsensusProtocol {
 	f := (numNodes - 1) / 3
-
-	// LÓGICA DE TIMEOUT ADAPTATIVO
 	baseTimeout := float64(100 + numNodes*10)
 	delta := float64(50 + numNodes*5)
 
@@ -104,53 +100,73 @@ func (tp *TendermintProtocol) Start() {
 	tp.sim.Schedule(tp.enterNewHeight, 0)
 }
 
-// HandleMessage agora introduz um atraso de processamento.
+// HandleMessage introduz um atraso e chama o processamento da mensagem.
 func (tp *TendermintProtocol) HandleMessage(msg simulator.Message) {
 	tp.sim.Schedule(func() {
 		tp.processMessage(msg)
 	}, NodeProcessingDelayMs)
 }
 
-// processMessage contém a lógica que antes estava em HandleMessage.
+// processMessage contém a lógica de tratamento de mensagens.
 func (tp *TendermintProtocol) processMessage(msg simulator.Message) {
 	tp.stateMutex.Lock()
-	defer tp.stateMutex.Unlock()
+	currentHeight := tp.height
+	currentRound := tp.round
+	currentStep := tp.step
+	tp.stateMutex.Unlock()
 
 	switch payload := msg.Payload.(type) {
 	case Proposal:
-		if payload.Height == tp.height && payload.Round == tp.round && tp.step == Propose && tp.proposal == nil {
-			tp.proposal = &payload.Block
-			tp.log(fmt.Sprintf("Recebeu proposta de %d para o bloco %d", msg.SenderID, payload.Block.ID))
+		if payload.Height == currentHeight && payload.Round == currentRound && currentStep == Propose {
+			tp.stateMutex.Lock()
+			if tp.proposal == nil {
+				tp.proposal = &payload.Block
+				tp.log(fmt.Sprintf("Recebeu proposta de %d para o bloco %d", msg.SenderID, payload.Block.ID))
+			}
+			tp.stateMutex.Unlock()
 		}
 	case PrevotePayload:
-		if payload.Height == tp.height && payload.Round == tp.round {
+		if payload.Height == currentHeight && payload.Round == currentRound && currentStep == Prevote {
+			added := false
 			tp.votesMutex.Lock()
 			if _, exists := tp.prevotes[payload.Vote.VoterID]; !exists {
 				tp.prevotes[payload.Vote.VoterID] = &payload.Vote
+				added = true
 			}
 			tp.votesMutex.Unlock()
+
+			if added {
+				tp.tryAdvanceToPrecommit(currentHeight, currentRound, false)
+			}
 		}
 	case PrecommitPayload:
-		if payload.Height == tp.height && payload.Round == tp.round {
+		if payload.Height == currentHeight && payload.Round == currentRound && currentStep == Precommit {
+			added := false
 			tp.votesMutex.Lock()
 			if _, exists := tp.precommits[payload.Vote.VoterID]; !exists {
 				tp.precommits[payload.Vote.VoterID] = &payload.Vote
+				added = true
 			}
 			tp.votesMutex.Unlock()
+
+			if added {
+				tp.tryAdvanceToDecision(currentHeight, currentRound, false)
+			}
 		}
 	case DecisionPayload:
+		tp.stateMutex.Lock()
 		if payload.Height >= tp.height {
 			tp.log(fmt.Sprintf("Recebeu notificação de decisão para altura %d. Sincronizando.", payload.Height))
 			tp.height = payload.Height + 1
 			tp.sim.Schedule(tp.enterNewHeight, 1.0)
 		}
+		tp.stateMutex.Unlock()
 	}
 }
 
 func (tp *TendermintProtocol) enterNewHeight() {
 	tp.stateMutex.Lock()
 	tp.log("Iniciando nova altura.")
-	tp.step = Propose
 	tp.round = 0
 	tp.resetRoundState(false)
 	tp.stateMutex.Unlock()
@@ -161,17 +177,8 @@ func (tp *TendermintProtocol) startRound() {
 	tp.stateMutex.Lock()
 	currentHeight := tp.height
 	currentRound := tp.round
-	timeout := tp.getTimeout(tp.timeoutPropose, currentRound)
+	tp.step = Propose
 	tp.log("Iniciando fase de Propose.")
-	tp.stateMutex.Unlock()
-
-	tp.doProposePhase()
-	tp.sim.Schedule(func() { tp.onTimeoutPropose(currentHeight, currentRound) }, timeout)
-}
-
-func (tp *TendermintProtocol) doProposePhase() {
-	tp.stateMutex.Lock()
-	defer tp.stateMutex.Unlock()
 
 	proposerID := tp.getProposer(tp.height, tp.round)
 	if tp.node.ID == proposerID {
@@ -187,33 +194,47 @@ func (tp *TendermintProtocol) doProposePhase() {
 		tp.log(fmt.Sprintf("É o proponente, enviando proposta para bloco %d", block.ID))
 		tp.node.Network.Broadcast(tp.node.ID, proposal)
 	}
+	tp.stateMutex.Unlock()
+
+	timeout := tp.getTimeout(tp.timeoutPropose, currentRound)
+	tp.sim.Schedule(func() { tp.onTimeoutPropose(currentHeight, currentRound) }, timeout)
 }
 
 func (tp *TendermintProtocol) onTimeoutPropose(expectedHeight, expectedRound int) {
 	tp.stateMutex.Lock()
-	if tp.height != expectedHeight || tp.round != expectedRound {
-		tp.stateMutex.Unlock()
+	defer tp.stateMutex.Unlock()
+
+	if tp.height != expectedHeight || tp.round != expectedRound || tp.step != Propose {
 		return
 	}
+
 	tp.log("Timeout de Propose, iniciando fase de Prevote.")
 	tp.step = Prevote
-	tp.broadcastVote(true)
+	tp.broadcastVote(true) // Broadcast Prevote
+
 	timeout := tp.getTimeout(tp.timeoutPrevote, expectedRound)
-	tp.stateMutex.Unlock()
-	tp.sim.Schedule(func() { tp.onTimeoutPrevote(expectedHeight, expectedRound) }, timeout)
+	tp.sim.Schedule(func() { tp.tryAdvanceToPrecommit(expectedHeight, expectedRound, true) }, timeout)
 }
 
-func (tp *TendermintProtocol) onTimeoutPrevote(expectedHeight, expectedRound int) {
+func (tp *TendermintProtocol) tryAdvanceToPrecommit(expectedHeight, expectedRound int, isTimeout bool) {
 	tp.stateMutex.Lock()
-	if tp.height != expectedHeight || tp.round != expectedRound {
-		tp.stateMutex.Unlock()
+	defer tp.stateMutex.Unlock()
+
+	if tp.height != expectedHeight || tp.round != expectedRound || tp.step != Prevote {
 		return
 	}
+
 	tp.votesMutex.RLock()
 	polkaBlockID, hasPolka := tp.getQuorum(tp.prevotes)
 	tp.votesMutex.RUnlock()
-	tp.log("Timeout de Prevote, iniciando fase de Precommit.")
+
+	if !isTimeout && !hasPolka {
+		return
+	}
+
+	tp.log("Avançando para a fase de Precommit.")
 	tp.step = Precommit
+
 	if hasPolka {
 		logMsg := "formou Polka para <nil>"
 		if polkaBlockID != nil {
@@ -222,24 +243,34 @@ func (tp *TendermintProtocol) onTimeoutPrevote(expectedHeight, expectedRound int
 		tp.log(logMsg)
 		tp.lockedVote = &Vote{BlockID: polkaBlockID}
 	} else {
-		tp.log("Não formou Polka, votando <nil>.")
+		tp.log("Timeout de Prevote sem Polka, votando <nil>.")
 		tp.lockedVote = &Vote{BlockID: nil}
 	}
-	tp.broadcastVote(false)
+
+	tp.broadcastVote(false) // Broadcast Precommit
+
 	timeout := tp.getTimeout(tp.timeoutPrecommit, expectedRound)
-	tp.stateMutex.Unlock()
-	tp.sim.Schedule(func() { tp.onTimeoutPrecommit(expectedHeight, expectedRound) }, timeout)
+	tp.sim.Schedule(func() { tp.tryAdvanceToDecision(expectedHeight, expectedRound, true) }, timeout)
 }
 
-func (tp *TendermintProtocol) onTimeoutPrecommit(expectedHeight, expectedRound int) {
+func (tp *TendermintProtocol) tryAdvanceToDecision(expectedHeight, expectedRound int, isTimeout bool) {
 	tp.stateMutex.Lock()
 	defer tp.stateMutex.Unlock()
-	if tp.height != expectedHeight || tp.round != expectedRound {
+
+	if tp.height != expectedHeight || tp.round != expectedRound || tp.step != Precommit {
 		return
 	}
+
 	tp.votesMutex.RLock()
 	commitBlockID, hasCommitQuorum := tp.getQuorum(tp.precommits)
 	tp.votesMutex.RUnlock()
+
+	if !isTimeout {
+		if !hasCommitQuorum || commitBlockID == nil {
+			return
+		}
+	}
+
 	if hasCommitQuorum && commitBlockID != nil {
 		tp.mc.RecordFinalization(*commitBlockID, tp.sim.CurrentTime)
 		tp.log(fmt.Sprintf("BLOCO %d FINALIZADO! Notificando outros nós.", *commitBlockID))
@@ -247,7 +278,7 @@ func (tp *TendermintProtocol) onTimeoutPrecommit(expectedHeight, expectedRound i
 		tp.height++
 		tp.sim.Schedule(tp.enterNewHeight, 1.0)
 	} else {
-		tp.log("Timeout ou <nil> quorum, avançando para a próxima rodada.")
+		tp.log("Timeout ou <nil> quorum de Precommit, avançando para a próxima rodada.")
 		tp.round++
 		tp.resetRoundState(true)
 		tp.sim.Schedule(tp.startRound, 1.0)
@@ -310,19 +341,14 @@ func (tp *TendermintProtocol) getQuorum(votes map[int]*Vote) (*int, bool) {
 }
 
 func (tp *TendermintProtocol) resetRoundState(keepLockedVote bool) {
-	tp.step = Propose
 	tp.proposal = nil
 	if !keepLockedVote {
 		tp.lockedVote = nil
 	}
 
 	tp.votesMutex.Lock()
-	for k := range tp.prevotes {
-		delete(tp.prevotes, k)
-	}
-	for k := range tp.precommits {
-		delete(tp.precommits, k)
-	}
+	clear(tp.prevotes)
+	clear(tp.precommits)
 	tp.votesMutex.Unlock()
 }
 
