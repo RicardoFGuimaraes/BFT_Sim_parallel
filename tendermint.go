@@ -45,7 +45,7 @@ type DecisionPayload struct {
 
 // --- Constantes Dinâmicas e de Simulação ---
 const (
-	NodeProcessingDelayMs = 2.0
+	NodeProcessingDelayMs = 100.0
 )
 
 // --- Implementação do Protocolo Tendermint ---
@@ -75,8 +75,8 @@ type TendermintProtocol struct {
 // NewTendermintProtocol cria uma nova instância do protocolo.
 func NewTendermintProtocol(node *simulator.Node, sim *simulator.Simulation, mc *simulator.MetricsCollector, numNodes int) simulator.ConsensusProtocol {
 	f := (numNodes - 1) / 3
-	baseTimeout := float64(100 + numNodes*10)
-	delta := float64(50 + numNodes*5)
+	baseTimeout := float64(3000) // Increased timeouts for stability
+	delta := float64(500)
 
 	return &TendermintProtocol{
 		node:             node,
@@ -117,11 +117,16 @@ func (tp *TendermintProtocol) processMessage(msg simulator.Message) {
 
 	switch payload := msg.Payload.(type) {
 	case Proposal:
+		// We only care about proposals for the current height/round/step
 		if payload.Height == currentHeight && payload.Round == currentRound && currentStep == Propose {
 			tp.stateMutex.Lock()
+			// Only accept the first valid proposal for this round
 			if tp.proposal == nil {
 				tp.proposal = &payload.Block
 				tp.log(fmt.Sprintf("Recebeu proposta de %d para o bloco %d", msg.SenderID, payload.Block.ID))
+				// *** REACTIVITY CHANGE ***
+				// Instead of waiting for the timeout, immediately enter the Prevote step.
+				tp.enterPrevote(currentHeight, currentRound)
 			}
 			tp.stateMutex.Unlock()
 		}
@@ -136,6 +141,7 @@ func (tp *TendermintProtocol) processMessage(msg simulator.Message) {
 			tp.votesMutex.Unlock()
 
 			if added {
+				// Attempt to advance as soon as a new vote comes in.
 				tp.tryAdvanceToPrecommit(currentHeight, currentRound, false)
 			}
 		}
@@ -150,6 +156,7 @@ func (tp *TendermintProtocol) processMessage(msg simulator.Message) {
 			tp.votesMutex.Unlock()
 
 			if added {
+				// Attempt to decide as soon as a new vote comes in.
 				tp.tryAdvanceToDecision(currentHeight, currentRound, false)
 			}
 		}
@@ -186,33 +193,54 @@ func (tp *TendermintProtocol) startRound() {
 		if tp.lockedVote != nil && tp.lockedVote.BlockID != nil {
 			block = Block{ID: *tp.lockedVote.BlockID}
 		} else {
+			// Unique block ID for each height/round combination
 			block = Block{ID: tp.height*10000 + tp.round}
 		}
 		tp.mc.RecordProposal(block.ID, tp.sim.CurrentTime)
 		proposal := Proposal{Block: block, Height: tp.height, Round: tp.round}
+		// The proposal is set here for the proposer itself
 		tp.proposal = &block
 		tp.log(fmt.Sprintf("É o proponente, enviando proposta para bloco %d", block.ID))
 		tp.node.Network.Broadcast(tp.node.ID, proposal)
 	}
 	tp.stateMutex.Unlock()
 
+	// The timeout now acts as a fallback if the proposer is slow or the message is lost.
 	timeout := tp.getTimeout(tp.timeoutPropose, currentRound)
 	tp.sim.Schedule(func() { tp.onTimeoutPropose(currentHeight, currentRound) }, timeout)
 }
 
+// *** REACTIVITY CHANGE ***
+// onTimeoutPropose now just triggers the transition to Prevote. The core logic is in enterPrevote.
 func (tp *TendermintProtocol) onTimeoutPropose(expectedHeight, expectedRound int) {
 	tp.stateMutex.Lock()
 	defer tp.stateMutex.Unlock()
 
+	// If we already progressed to the next step (e.g., by receiving a proposal), do nothing.
 	if tp.height != expectedHeight || tp.round != expectedRound || tp.step != Propose {
 		return
 	}
 
 	tp.log("Timeout de Propose, iniciando fase de Prevote.")
+	// A proposal was not received in time.
+	tp.enterPrevote(expectedHeight, expectedRound)
+}
+
+// *** REACTIVITY CHANGE ***
+// This new function contains the logic to enter the prevote step.
+// It can be called either by receiving a proposal or by a timeout.
+func (tp *TendermintProtocol) enterPrevote(expectedHeight, expectedRound int) {
+	// This function is now called with the lock held.
+	// Ensure we are in the correct state to enter prevote.
+	if tp.height != expectedHeight || tp.round != expectedRound || tp.step != Propose {
+		return
+	}
+
 	tp.step = Prevote
-	tp.broadcastVote(true) // Broadcast Prevote
+	tp.broadcastVote(true) // Broadcast Prevote vote
 
 	timeout := tp.getTimeout(tp.timeoutPrevote, expectedRound)
+	// The timeout handler for prevote is tryAdvanceToPrecommit
 	tp.sim.Schedule(func() { tp.tryAdvanceToPrecommit(expectedHeight, expectedRound, true) }, timeout)
 }
 
@@ -228,6 +256,7 @@ func (tp *TendermintProtocol) tryAdvanceToPrecommit(expectedHeight, expectedRoun
 	polkaBlockID, hasPolka := tp.getQuorum(tp.prevotes)
 	tp.votesMutex.RUnlock()
 
+	// If it's not a timeout, we only proceed if we actually have a polka.
 	if !isTimeout && !hasPolka {
 		return
 	}
@@ -243,11 +272,12 @@ func (tp *TendermintProtocol) tryAdvanceToPrecommit(expectedHeight, expectedRoun
 		tp.log(logMsg)
 		tp.lockedVote = &Vote{BlockID: polkaBlockID}
 	} else {
+		// This case is now only reached on timeout
 		tp.log("Timeout de Prevote sem Polka, votando <nil>.")
 		tp.lockedVote = &Vote{BlockID: nil}
 	}
 
-	tp.broadcastVote(false) // Broadcast Precommit
+	tp.broadcastVote(false) // Broadcast Precommit vote
 
 	timeout := tp.getTimeout(tp.timeoutPrecommit, expectedRound)
 	tp.sim.Schedule(func() { tp.tryAdvanceToDecision(expectedHeight, expectedRound, true) }, timeout)
@@ -265,6 +295,7 @@ func (tp *TendermintProtocol) tryAdvanceToDecision(expectedHeight, expectedRound
 	commitBlockID, hasCommitQuorum := tp.getQuorum(tp.precommits)
 	tp.votesMutex.RUnlock()
 
+	// If it's not a timeout, we only proceed if we have a commit for a specific block.
 	if !isTimeout {
 		if !hasCommitQuorum || commitBlockID == nil {
 			return
@@ -278,9 +309,10 @@ func (tp *TendermintProtocol) tryAdvanceToDecision(expectedHeight, expectedRound
 		tp.height++
 		tp.sim.Schedule(tp.enterNewHeight, 1.0)
 	} else {
+		// This case is now mostly for timeouts or nil-vote quorums.
 		tp.log("Timeout ou <nil> quorum de Precommit, avançando para a próxima rodada.")
 		tp.round++
-		tp.resetRoundState(true)
+		tp.resetRoundState(true) // Keep the locked vote for the next round
 		tp.sim.Schedule(tp.startRound, 1.0)
 	}
 }
@@ -292,11 +324,13 @@ func (tp *TendermintProtocol) broadcastVote(isPrevote bool) {
 	vote := &Vote{VoterID: tp.node.ID}
 
 	if isPrevote {
+		// Prevote for the proposal we received/have. Can be nil if timed out.
 		if tp.proposal != nil {
 			vote.BlockID = &tp.proposal.ID
 		}
 		votePayload = PrevotePayload{Vote: *vote, Height: tp.height, Round: tp.round}
 	} else {
+		// Precommit for our locked vote.
 		if tp.lockedVote != nil {
 			vote.BlockID = tp.lockedVote.BlockID
 		}
