@@ -20,8 +20,8 @@ const (
 	// Experimente com 4, 8, 16, 32...
 	NumNodes         = 32
 	NetworkLatencyMs = 100
-	SimulationTimeMs = 1500000 // 15 segundos
-	Debug            = true
+	SimulationTimeMs = 240000 // 15 segundos
+	Debug            = false
 )
 
 // --- Função Principal ---
